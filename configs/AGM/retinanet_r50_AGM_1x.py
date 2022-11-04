@@ -6,7 +6,7 @@ _base_ = [
 
 model = dict(
     neck=dict(
-        type='AutoCBAM_FPN',
+        type='CA_FPN',
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         # start_level=1,

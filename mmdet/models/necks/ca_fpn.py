@@ -8,18 +8,47 @@ from mmcv.runner import BaseModule, auto_fp16
 from ..builder import NECKS
 
 
-class SpatialAttention(nn.Module):
-    """
-        tanh通道注意力
-    """
+class CAM(nn.Module):
+    def __init__(self, inplanes, ratio=16):
+        super(CAM, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc11 = nn.Conv2d(inplanes, inplanes // ratio, 1, bias=False)
+        self.fc12 = nn.Conv2d(inplanes // ratio, inplanes, 1, bias=False)
+        self.fc21 = nn.Conv2d(inplanes, inplanes // ratio, 1, bias=False)
+        self.fc22 = nn.Conv2d(inplanes // ratio, inplanes, 1, bias=False)
+
+        self.relu = nn.ReLU()
+        self.w1 = nn.Conv2d(inplanes, 8, 1, bias=False)
+        self.w2 = nn.Conv2d(inplanes, 8, 1, bias=False)
+        self.w = nn.Conv2d(8*2, 2, 1, bias=False)
+        self.softmax = nn.Softmax(dim=1)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # print(x.shape)
+        B, C, _, _ = x.shape
+        avg_out = self.fc12(self.relu(self.fc11(self.avg_pool(x))))
+        max_out = self.fc22(self.relu(self.fc21(self.max_pool(x))))
+
+        avg_w = self.w1(avg_out)
+        max_w = self.w2(max_out)
+        w = torch.cat([avg_w, max_w], dim=1)
+        w = self.softmax(w)
+        out = avg_out * w[:, 0:1, :, :] + max_out * w[:, 1:2, :, :]
+
+        return self.sigmoid(out)
+
+class NGM(nn.Module):
     def __init__(self, kernel_size=3):
-        super(SpatialAttention, self).__init__()
+        super(NGM, self).__init__()
 
         assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
         padding = 1 if kernel_size == 3 else 3
 
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
-        # self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, bias=False)
         self.tanh = nn.Tanh()
 
     def forward(self, x):
@@ -29,9 +58,32 @@ class SpatialAttention(nn.Module):
         x = self.conv(x)
         return self.tanh(x)
 
+class AGM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(AGM, self).__init__()
+        self.ca = CAM(inplanes=in_planes, ratio=ratio)
+        self.sa = NGM(kernel_size)
+
+    def forward(self, x):
+        out = x * self.ca(x)
+        result = x * self.sa(out)
+        return result
+
+
+class CSM(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(CSM, self).__init__()
+        self.pixelshuffle = nn.PixelShuffle(2)
+        self.conv = nn.Conv2d(in_channels=in_channel//4, out_channels=out_channel, kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x_shuffle = self.pixelshuffle(x)
+        x_shuffle = self.conv(x_shuffle)
+
+        return x_shuffle
 
 @NECKS.register_module()
-class AutoSpatial_FPN(BaseModule):
+class CA_FPN(BaseModule):
     r"""Feature Pyramid Network.
 
     This is an implementation of paper `Feature Pyramid Networks for Object
@@ -97,7 +149,7 @@ class AutoSpatial_FPN(BaseModule):
                  upsample_cfg=dict(mode='nearest'),
                  init_cfg=dict(
                      type='Xavier', layer='Conv2d', distribution='uniform')):
-        super(AutoSpatial_FPN, self).__init__(init_cfg)
+        super(CA_FPN, self).__init__(init_cfg)
         assert isinstance(in_channels, list)
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -108,7 +160,6 @@ class AutoSpatial_FPN(BaseModule):
         self.fp16_enabled = False
         self.upsample_cfg = upsample_cfg.copy()
 
-        # self.backbone_end_level：理解为 用来计数需要计算的FPN的最后层数，要么为给定值，要么为输入的channel的数量
         if end_level == -1:
             self.backbone_end_level = self.num_ins
             assert num_outs >= self.num_ins - start_level
@@ -130,19 +181,24 @@ class AutoSpatial_FPN(BaseModule):
         self.lateral_convs = nn.ModuleList()
         self.fpn_convs = nn.ModuleList()
         self.auto_chanelattn = nn.ModuleList()
+        self.ReLU = nn.ReLU()
 
         for i in range(self.start_level, self.backbone_end_level):
-            # in_channels, out_channels, kernel_size, stride = 1, padding = 0, dilation = 1, groups = 1, 同nn.Conv2d
-            l_conv = ConvModule(
-                in_channels[i],
-                out_channels,
-                1,
-                conv_cfg=conv_cfg,
-                norm_cfg=norm_cfg if not self.no_norm_on_lateral else None,
-                act_cfg=act_cfg,
-                inplace=False)
-            auto_chanelattn = SpatialAttention(3)
-            # auto_chanelattn = SpatialAttention(1)
+            if in_channels[i] > out_channels:
+                l_conv = CSM(
+                    in_channels[i],
+                    out_channels
+                )
+            else:
+                l_conv = ConvModule(
+                    in_channels[i],
+                    out_channels,
+                    1,
+                    conv_cfg=conv_cfg,
+                    norm_cfg=norm_cfg if not self.no_norm_on_lateral else None,
+                    act_cfg=act_cfg,
+                    inplace=False)
+            auto_chanelattn = AGM(out_channels, ratio=16, kernel_size=7)
             fpn_conv = ConvModule(
                 out_channels,
                 out_channels,
@@ -159,8 +215,6 @@ class AutoSpatial_FPN(BaseModule):
 
         # add extra conv layers (e.g., RetinaNet)
         extra_levels = num_outs - self.backbone_end_level + self.start_level
-        # 判断是否有除原层数之外的多余层数
-        # faster_rcnn中 self.add_extra_convs 为 false
         if self.add_extra_convs and extra_levels >= 1:
             for i in range(extra_levels):
                 if i == 0 and self.add_extra_convs == 'on_input':
@@ -189,7 +243,6 @@ class AutoSpatial_FPN(BaseModule):
         assert len(inputs) == len(self.in_channels)
 
         # build laterals
-        # 将backbone输出的特征进行压缩
         laterals = [
             lateral_conv(inputs[i + self.start_level])
             for i, lateral_conv in enumerate(self.lateral_convs)
@@ -199,19 +252,20 @@ class AutoSpatial_FPN(BaseModule):
         used_backbone_levels = len(laterals)
         for i in range(0, used_backbone_levels-1, 1):
             prev_shape = laterals[i].shape[2:]
-            # 进行上采样
             up_feat = F.interpolate(laterals[i+1], size=prev_shape, **self.upsample_cfg)
             up_feat = up_feat * self.auto_chanelattn[i](up_feat)
-            laterals[i] += up_feat
-        #
-        # from tools.visualization.backbone_featuremap import draw_feature_map
-        # draw_feature_map(laterals, save_dir="output_feature/assign_fpn_Spatial")
+            ## up_feat = laterals[i] * self.auto_chanelattn[i](up_feat)
+            # ----------------------------------------------------------------
+            # gate = self.auto_chanelattn[i](up_feat)
+            # up_feat = laterals[i] * torch.clamp(gate, max=0) + up_feat * torch.clamp(gate, min=0)
+            # ----------------------------------------------------------------
+            # up_feat = up_feat * self.auto_chanelattn[i](up_feat, laterals[i])
+            laterals[i] = laterals[i] + up_feat
 
-        # build outputs
-        # part 1: from original levels
         outs = [
             self.fpn_convs[i](laterals[i]) for i in range(used_backbone_levels)
         ]
+        # outs = laterals
 
         if self.num_outs > len(outs):
             # use max pool to get more levels on top of outputs
@@ -236,6 +290,8 @@ class AutoSpatial_FPN(BaseModule):
                     else:
                         outs.append(self.fpn_convs[i](outs[-1]))
 
+        # from tools.visualization.backbone_featuremap import draw_feature_map
+        # draw_feature_map(outs, save_dir="output_feature/fpn/assign_fpn_CBAM")
         return tuple(outs)
 
 
